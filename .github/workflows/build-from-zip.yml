@@ -2,30 +2,42 @@ name: Build LoganOS APK From ZIP
 
 on:
   workflow_dispatch:
+    inputs:
+      apk_version:
+        description: "APK version name, for example 1.0.0-beta.3.3"
+        required: false
+        default: "1.0.0-beta.3.3"
+
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - master
+
+env:
+  APK_VERSION: ${{ github.event.inputs.apk_version || '1.0.0-beta.3.3' }}
 
 jobs:
   build:
-    name: Build Debug APK From Uploaded ZIP
+    name: Build LoganOS APK
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare log folder
+      - name: Prepare build logs
         shell: bash
         run: |
           mkdir -p build-logs
-          echo "LoganOS GitHub Actions build started." > build-logs/environment.txt
+          echo "LoganOS build started" > build-logs/environment.txt
           echo "Date: $(date)" >> build-logs/environment.txt
           echo "Runner OS: $RUNNER_OS" >> build-logs/environment.txt
           echo "GitHub ref: $GITHUB_REF" >> build-logs/environment.txt
           echo "GitHub SHA: $GITHUB_SHA" >> build-logs/environment.txt
+          echo "APK version: $APK_VERSION" >> build-logs/environment.txt
           echo "" >> build-logs/environment.txt
           echo "Repository files:" > build-logs/repository-files.txt
-          find . -maxdepth 3 -type f | sort >> build-logs/repository-files.txt
+          find . -maxdepth 4 -type f | sort >> build-logs/repository-files.txt
 
       - name: Find LoganOS ZIP
         id: zip
@@ -34,36 +46,33 @@ jobs:
           ZIP_FILE=$(find . -maxdepth 1 -type f -name 'LoganOS*.zip' | sort | tail -n 1)
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "No LoganOS ZIP file found yet." | tee build-logs/zip-search.log
-            echo "Upload LoganOS_v1_0_0_beta_Kotlin_Starter.zip to start the build." | tee -a build-logs/zip-search.log
-            echo "has_zip=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "No LoganOS ZIP file found in repository root." | tee build-logs/zip-search.log
+            echo "Upload a file named like LoganOS_v1_0_0_beta_zz_LiveData_UI_3_3.zip" | tee -a build-logs/zip-search.log
+            exit 1
           fi
 
           echo "Found ZIP: $ZIP_FILE" | tee build-logs/zip-search.log
-          echo "has_zip=true" >> "$GITHUB_OUTPUT"
           echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
 
-      - name: Unzip project
-        if: steps.zip.outputs.has_zip == 'true'
+      - name: Unzip LoganOS project
         shell: bash
         run: |
           rm -rf extracted
           mkdir extracted
           unzip -q "${{ steps.zip.outputs.zip_file }}" -d extracted
-          echo "ZIP extracted." | tee build-logs/unzip.log
+
+          echo "ZIP extracted successfully." | tee build-logs/unzip.log
           echo "Extracted files:" > build-logs/extracted-files.txt
-          find extracted -maxdepth 5 -type f | sort >> build-logs/extracted-files.txt
+          find extracted -maxdepth 6 -type f | sort >> build-logs/extracted-files.txt
 
       - name: Locate Android Gradle project
-        if: steps.zip.outputs.has_zip == 'true'
         id: project
         shell: bash
         run: |
           if [ -f extracted/settings.gradle.kts ] || [ -f extracted/settings.gradle ]; then
             PROJECT_DIR="extracted"
           else
-            PROJECT_DIR=$(find extracted -maxdepth 4 \( -name settings.gradle.kts -o -name settings.gradle \) -print -quit | xargs -r dirname)
+            PROJECT_DIR=$(find extracted -maxdepth 5 \( -name settings.gradle.kts -o -name settings.gradle \) -print -quit | xargs -r dirname)
           fi
 
           if [ -z "$PROJECT_DIR" ]; then
@@ -75,35 +84,56 @@ jobs:
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
 
           echo "Project files:" > build-logs/project-files.txt
-          find "$PROJECT_DIR" -maxdepth 5 -type f | sort >> build-logs/project-files.txt
+          find "$PROJECT_DIR" -maxdepth 6 -type f | sort >> build-logs/project-files.txt
 
       - name: Set up JDK 17
-        if: steps.zip.outputs.has_zip == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
 
       - name: Set up Gradle
-        if: steps.zip.outputs.has_zip == 'true'
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.10.2
 
       - name: Build debug APK
-        if: steps.zip.outputs.has_zip == 'true'
         working-directory: ${{ steps.project.outputs.project_dir }}
         shell: bash
         run: |
           set -o pipefail
-          gradle assembleDebug --stacktrace --info 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/gradle-build.log"
+
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew assembleDebug --stacktrace --info 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/gradle-build.log"
+          else
+            gradle assembleDebug --stacktrace --info 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/gradle-build.log"
+          fi
+
+      - name: Prepare named APK
+        shell: bash
+        run: |
+          mkdir -p release-apk
+
+          APK_FILE=$(find "${{ steps.project.outputs.project_dir }}/app/build/outputs/apk/debug" -name "*.apk" | head -n 1)
+
+          if [ -z "$APK_FILE" ]; then
+            echo "APK file not found." | tee build-logs/apk-rename.log
+            exit 1
+          fi
+
+          TARGET_APK="release-apk/LoganOS-v${APK_VERSION}-debug.apk"
+
+          cp "$APK_FILE" "$TARGET_APK"
+
+          echo "Original APK: $APK_FILE" | tee build-logs/apk-rename.log
+          echo "Renamed APK: $TARGET_APK" | tee -a build-logs/apk-rename.log
 
       - name: Upload APK artifact
-        if: success() && steps.zip.outputs.has_zip == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: LoganOS-debug-apk
-          path: ${{ steps.project.outputs.project_dir }}/app/build/outputs/apk/debug/*.apk
+          name: LoganOS-v${{ env.APK_VERSION }}-apk
+          path: release-apk/*.apk
 
       - name: Upload build logs
         if: always()
