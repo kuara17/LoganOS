@@ -1,0 +1,113 @@
+name: Build LoganOS APK From ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    name: Build Debug APK From Uploaded ZIP
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare log folder
+        shell: bash
+        run: |
+          mkdir -p build-logs
+          echo "LoganOS GitHub Actions build started." > build-logs/environment.txt
+          echo "Date: $(date)" >> build-logs/environment.txt
+          echo "Runner OS: $RUNNER_OS" >> build-logs/environment.txt
+          echo "GitHub ref: $GITHUB_REF" >> build-logs/environment.txt
+          echo "GitHub SHA: $GITHUB_SHA" >> build-logs/environment.txt
+          echo "" >> build-logs/environment.txt
+          echo "Repository files:" > build-logs/repository-files.txt
+          find . -maxdepth 3 -type f | sort >> build-logs/repository-files.txt
+
+      - name: Find LoganOS ZIP
+        id: zip
+        shell: bash
+        run: |
+          ZIP_FILE=$(find . -maxdepth 1 -type f -name 'LoganOS*.zip' | sort | tail -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "No LoganOS ZIP file found yet." | tee build-logs/zip-search.log
+            echo "Upload LoganOS_v1_0_0_beta_Kotlin_Starter.zip to start the build." | tee -a build-logs/zip-search.log
+            echo "has_zip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Found ZIP: $ZIP_FILE" | tee build-logs/zip-search.log
+          echo "has_zip=true" >> "$GITHUB_OUTPUT"
+          echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Unzip project
+        if: steps.zip.outputs.has_zip == 'true'
+        shell: bash
+        run: |
+          rm -rf extracted
+          mkdir extracted
+          unzip -q "${{ steps.zip.outputs.zip_file }}" -d extracted
+          echo "ZIP extracted." | tee build-logs/unzip.log
+          echo "Extracted files:" > build-logs/extracted-files.txt
+          find extracted -maxdepth 5 -type f | sort >> build-logs/extracted-files.txt
+
+      - name: Locate Android Gradle project
+        if: steps.zip.outputs.has_zip == 'true'
+        id: project
+        shell: bash
+        run: |
+          if [ -f extracted/settings.gradle.kts ] || [ -f extracted/settings.gradle ]; then
+            PROJECT_DIR="extracted"
+          else
+            PROJECT_DIR=$(find extracted -maxdepth 4 \( -name settings.gradle.kts -o -name settings.gradle \) -print -quit | xargs -r dirname)
+          fi
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "Android Gradle project not found inside ZIP." | tee build-logs/project-detection.log
+            exit 1
+          fi
+
+          echo "Project directory: $PROJECT_DIR" | tee build-logs/project-detection.log
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+          echo "Project files:" > build-logs/project-files.txt
+          find "$PROJECT_DIR" -maxdepth 5 -type f | sort >> build-logs/project-files.txt
+
+      - name: Set up JDK 17
+        if: steps.zip.outputs.has_zip == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        if: steps.zip.outputs.has_zip == 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+
+      - name: Build debug APK
+        if: steps.zip.outputs.has_zip == 'true'
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle assembleDebug --stacktrace --info 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/gradle-build.log"
+
+      - name: Upload APK artifact
+        if: success() && steps.zip.outputs.has_zip == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: LoganOS-debug-apk
+          path: ${{ steps.project.outputs.project_dir }}/app/build/outputs/apk/debug/*.apk
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LoganOS-build-logs
+          path: build-logs/
