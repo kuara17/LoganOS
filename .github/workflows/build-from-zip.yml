@@ -1,20 +1,20 @@
-name: Build LoganOS APK From ZIP
+name: Build LoganOS APK
 
 on:
   workflow_dispatch:
     inputs:
-      apk_version:
-        description: "APK version name, for example 1.0.0-beta.3.3"
-        required: false
-        default: "1.0.0-beta.3.3"
-
-  push:
-    branches:
-      - main
-      - master
-
-env:
-  APK_VERSION: ${{ github.event.inputs.apk_version || '1.0.0-beta.3.3' }}
+      version_name:
+        description: "APK sürümü örn: 1.0.0-beta.3.5.3"
+        required: true
+        default: "1.0.0-beta.3.5.3"
+      apk_name:
+        description: "APK adı örn: LoganOS-v1.0.0-beta.3.5.3-debug.apk"
+        required: true
+        default: "LoganOS-v1.0.0-beta.3.5.3-debug.apk"
+      artifact_name:
+        description: "Artifact adı örn: LoganOS-v1.0.0-beta.3.5.3-apk"
+        required: true
+        default: "LoganOS-v1.0.0-beta.3.5.3-apk"
 
 jobs:
   build:
@@ -22,69 +22,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout project
         uses: actions/checkout@v4
-
-      - name: Prepare build logs
-        shell: bash
-        run: |
-          mkdir -p build-logs
-          echo "LoganOS build started" > build-logs/environment.txt
-          echo "Date: $(date)" >> build-logs/environment.txt
-          echo "Runner OS: $RUNNER_OS" >> build-logs/environment.txt
-          echo "GitHub ref: $GITHUB_REF" >> build-logs/environment.txt
-          echo "GitHub SHA: $GITHUB_SHA" >> build-logs/environment.txt
-          echo "APK version: $APK_VERSION" >> build-logs/environment.txt
-          echo "" >> build-logs/environment.txt
-          echo "Repository files:" > build-logs/repository-files.txt
-          find . -maxdepth 4 -type f | sort >> build-logs/repository-files.txt
-
-      - name: Find LoganOS ZIP
-        id: zip
-        shell: bash
-        run: |
-          ZIP_FILE=$(find . -maxdepth 1 -type f -name 'LoganOS*.zip' | sort | tail -n 1)
-
-          if [ -z "$ZIP_FILE" ]; then
-            echo "No LoganOS ZIP file found in repository root." | tee build-logs/zip-search.log
-            echo "Upload a file named like LoganOS_v1_0_0_beta_zz_LiveData_UI_3_3.zip" | tee -a build-logs/zip-search.log
-            exit 1
-          fi
-
-          echo "Found ZIP: $ZIP_FILE" | tee build-logs/zip-search.log
-          echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
-
-      - name: Unzip LoganOS project
-        shell: bash
-        run: |
-          rm -rf extracted
-          mkdir extracted
-          unzip -q "${{ steps.zip.outputs.zip_file }}" -d extracted
-
-          echo "ZIP extracted successfully." | tee build-logs/unzip.log
-          echo "Extracted files:" > build-logs/extracted-files.txt
-          find extracted -maxdepth 6 -type f | sort >> build-logs/extracted-files.txt
-
-      - name: Locate Android Gradle project
-        id: project
-        shell: bash
-        run: |
-          if [ -f extracted/settings.gradle.kts ] || [ -f extracted/settings.gradle ]; then
-            PROJECT_DIR="extracted"
-          else
-            PROJECT_DIR=$(find extracted -maxdepth 5 \( -name settings.gradle.kts -o -name settings.gradle \) -print -quit | xargs -r dirname)
-          fi
-
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "Android Gradle project not found inside ZIP." | tee build-logs/project-detection.log
-            exit 1
-          fi
-
-          echo "Project directory: $PROJECT_DIR" | tee build-logs/project-detection.log
-          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-
-          echo "Project files:" > build-logs/project-files.txt
-          find "$PROJECT_DIR" -maxdepth 6 -type f | sort >> build-logs/project-files.txt
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -97,47 +36,31 @@ jobs:
         with:
           gradle-version: 8.10.2
 
+      - name: Show requested version
+        run: |
+          echo "Version: ${{ github.event.inputs.version_name }}"
+          echo "APK name: ${{ github.event.inputs.apk_name }}"
+          echo "Artifact: ${{ github.event.inputs.artifact_name }}"
+
       - name: Build debug APK
-        working-directory: ${{ steps.project.outputs.project_dir }}
-        shell: bash
+        run: gradle assembleDebug --stacktrace
+
+      - name: Rename APK
         run: |
-          set -o pipefail
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk "dist/${{ github.event.inputs.apk_name }}"
 
-          if [ -f "./gradlew" ]; then
-            chmod +x ./gradlew
-            ./gradlew assembleDebug --stacktrace --info 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/gradle-build.log"
-          else
-            gradle assembleDebug --stacktrace --info 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/gradle-build.log"
-          fi
-
-      - name: Prepare named APK
-        shell: bash
-        run: |
-          mkdir -p release-apk
-
-          APK_FILE=$(find "${{ steps.project.outputs.project_dir }}/app/build/outputs/apk/debug" -name "*.apk" | head -n 1)
-
-          if [ -z "$APK_FILE" ]; then
-            echo "APK file not found." | tee build-logs/apk-rename.log
-            exit 1
-          fi
-
-          TARGET_APK="release-apk/LoganOS-v${APK_VERSION}-debug.apk"
-
-          cp "$APK_FILE" "$TARGET_APK"
-
-          echo "Original APK: $APK_FILE" | tee build-logs/apk-rename.log
-          echo "Renamed APK: $TARGET_APK" | tee -a build-logs/apk-rename.log
-
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: LoganOS-v${{ env.APK_VERSION }}-apk
-          path: release-apk/*.apk
+          name: ${{ github.event.inputs.artifact_name }}
+          path: dist/${{ github.event.inputs.apk_name }}
 
       - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: LoganOS-build-logs
-          path: build-logs/
+          path: |
+            **/build/reports/**
+            **/build/outputs/logs/**
