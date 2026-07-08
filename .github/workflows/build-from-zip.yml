@@ -1,20 +1,12 @@
-name: Build LoganOS APK
+name: Build APK Manual
 
 on:
   workflow_dispatch:
     inputs:
       version_name:
-        description: "APK sürümü örn: 1.0.0-beta.3.5.3"
+        description: "Sürüm örn: 1.0.0-beta.3.6.1"
         required: true
-        default: "1.0.0-beta.3.5.3"
-      apk_name:
-        description: "APK adı örn: LoganOS-v1.0.0-beta.3.5.3-debug.apk"
-        required: true
-        default: "LoganOS-v1.0.0-beta.3.5.3-debug.apk"
-      artifact_name:
-        description: "Artifact adı örn: LoganOS-v1.0.0-beta.3.5.3-apk"
-        required: true
-        default: "LoganOS-v1.0.0-beta.3.5.3-apk"
+        default: "1.0.0-beta.3.6.1"
 
 jobs:
   build:
@@ -36,31 +28,60 @@ jobs:
         with:
           gradle-version: 8.10.2
 
-      - name: Show requested version
+      - name: Prepare source
+        id: prep
+        shell: bash
         run: |
-          echo "Version: ${{ github.event.inputs.version_name }}"
-          echo "APK name: ${{ github.event.inputs.apk_name }}"
-          echo "Artifact: ${{ github.event.inputs.artifact_name }}"
+          set -e
+
+          echo "Repository files:"
+          find . -maxdepth 2 -type f | sort
+
+          if [ -f "settings.gradle.kts" ] || [ -f "settings.gradle" ]; then
+            echo "Gradle project found at repository root."
+            echo "gradle_root=." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ZIP_FILE=$(find . -maxdepth 2 -type f -name "*.zip" | sort | tail -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "No Gradle project and no ZIP file found."
+            exit 1
+          fi
+
+          echo "Using ZIP: $ZIP_FILE"
+
+          rm -rf extracted
+          mkdir -p extracted
+          unzip -q "$ZIP_FILE" -d extracted
+
+          GRADLE_ROOT=$(find extracted -type f \( -name "settings.gradle.kts" -o -name "settings.gradle" \) | head -n 1 | xargs dirname)
+
+          if [ -z "$GRADLE_ROOT" ]; then
+            echo "No settings.gradle or settings.gradle.kts found inside ZIP."
+            find extracted -maxdepth 4 -type f | sort
+            exit 1
+          fi
+
+          echo "Gradle project found at: $GRADLE_ROOT"
+          echo "gradle_root=$GRADLE_ROOT" >> "$GITHUB_OUTPUT"
 
       - name: Build debug APK
-        run: gradle assembleDebug --stacktrace
+        shell: bash
+        run: |
+          set -e
+          cd "${{ steps.prep.outputs.gradle_root }}"
+          gradle assembleDebug --stacktrace
 
       - name: Rename APK
+        shell: bash
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk "dist/${{ github.event.inputs.apk_name }}"
+          cp "${{ steps.prep.outputs.gradle_root }}/app/build/outputs/apk/debug/app-debug.apk" "dist/LoganOS-v${{ github.event.inputs.version_name }}-debug.apk"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.inputs.artifact_name }}
-          path: dist/${{ github.event.inputs.apk_name }}
-
-      - name: Upload build logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: LoganOS-build-logs
-          path: |
-            **/build/reports/**
-            **/build/outputs/logs/**
+          name: LoganOS-v${{ github.event.inputs.version_name }}-apk
+          path: dist/LoganOS-v${{ github.event.inputs.version_name }}-debug.apk
