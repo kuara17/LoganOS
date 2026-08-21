@@ -1,4 +1,4 @@
- name: Build APK Manual
+name: Build APK Manual
 
 on:
   workflow_dispatch:
