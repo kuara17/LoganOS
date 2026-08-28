@@ -40,11 +40,15 @@ jobs:
           persist-credentials: false
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
-          cache: gradle
+          # Not: cache: gradle burada kasıtlı olarak KULLANILMIYOR.
+          # Proje ZIP içinden geliyorsa bu adımda henüz hiçbir gradle
+          # dosyası checkout'ta bulunmaz ve setup-java "No file matched" ile patlar.
+          # Gradle bağımlılık/derleme cache'i zaten gradle/actions/setup-gradle
+          # tarafından, Gradle fiilen çalıştığında devreye giriyor.
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
