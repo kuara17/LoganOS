@@ -26,6 +26,7 @@ jobs:
     name: Build, verify and publish signed APK
     if: inputs.confirm == 'PUBLISH'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     # Bu environment GitHub Settings > Environments altında oluşturulmalı.
     # İmzalama secret'ları yalnız burada tutulmalı ve mümkünse Required reviewers açılmalı.
@@ -43,12 +44,12 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+          cache: gradle
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.10.2
-
 
       - name: Prepare source
         id: prep
@@ -58,24 +59,36 @@ jobs:
 
           if [ -f "settings.gradle.kts" ] || [ -f "settings.gradle" ]; then
             echo "gradle_root=." >> "$GITHUB_OUTPUT"
-            exit 0
+          else
+            ZIP_FILE=$(find . -maxdepth 2 -type f -name "*.zip" | sort -V | tail -n 1)
+            if [ -z "$ZIP_FILE" ]; then
+              echo "::error::Gradle projesi bulunamadı ve kaynak ZIP de yok."
+              exit 1
+            fi
+
+            rm -rf extracted
+            mkdir -p extracted
+            unzip -q "$ZIP_FILE" -d extracted
+            SETTINGS_FILE=$(find extracted -type f \( -name "settings.gradle.kts" -o -name "settings.gradle" \) | head -n 1)
+            if [ -z "$SETTINGS_FILE" ]; then
+              echo "::error::ZIP içinde settings.gradle(.kts) bulunamadı."
+              exit 1
+            fi
+            echo "gradle_root=$(dirname "$SETTINGS_FILE")" >> "$GITHUB_OUTPUT"
           fi
 
-          ZIP_FILE=$(find . -maxdepth 2 -type f -name "*.zip" | sort -V | tail -n 1)
-          if [ -z "$ZIP_FILE" ]; then
-            echo "No Gradle project and no source ZIP found."
-            exit 1
+      - name: Pick build command (wrapper varsa onu kullan)
+        id: gradlecmd
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="${{ steps.prep.outputs.gradle_root }}"
+          if [ -x "$ROOT/gradlew" ]; then
+            echo "cmd=./gradlew" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::gradlew bulunamadı, sistemdeki 'gradle' (8.10.2) kullanılacak. Proje farklı bir Gradle sürümü bekliyorsa build başarısız olabilir."
+            echo "cmd=gradle" >> "$GITHUB_OUTPUT"
           fi
-
-          rm -rf extracted
-          mkdir -p extracted
-          unzip -q "$ZIP_FILE" -d extracted
-          SETTINGS_FILE=$(find extracted -type f \( -name "settings.gradle.kts" -o -name "settings.gradle" \) | head -n 1)
-          if [ -z "$SETTINGS_FILE" ]; then
-            echo "No Gradle settings file found inside ZIP."
-            exit 1
-          fi
-          echo "gradle_root=$(dirname "$SETTINGS_FILE")" >> "$GITHUB_OUTPUT"
 
       - name: Prepare release signing key
         shell: bash
@@ -88,10 +101,13 @@ jobs:
           set -euo pipefail
           for value in "$KEYSTORE_B64" "$STORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD"; do
             if [ -z "$value" ]; then
-              echo "Release-signing environment secrets are incomplete."
+              echo "::error::release-signing environment secret'ları eksik."
               exit 1
             fi
           done
+          echo "::add-mask::$STORE_PASSWORD"
+          echo "::add-mask::$KEY_PASSWORD"
+
           KEYSTORE_PATH="$RUNNER_TEMP/loganos-release.jks"
           printf '%s' "$KEYSTORE_B64" | base64 --decode > "$KEYSTORE_PATH"
           chmod 600 "$KEYSTORE_PATH"
@@ -106,14 +122,18 @@ jobs:
         run: |
           set -euo pipefail
           GRADLE_FILE="${{ steps.prep.outputs.gradle_root }}/app/build.gradle.kts"
+          if [ ! -f "$GRADLE_FILE" ]; then
+            echo "::error::$GRADLE_FILE bulunamadı."
+            exit 1
+          fi
           VERSION_NAME=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' "$GRADLE_FILE" | head -n 1)
           VERSION_CODE=$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' "$GRADLE_FILE" | head -n 1)
           if [ -z "$VERSION_NAME" ] || [ -z "$VERSION_CODE" ]; then
-            echo "Version metadata could not be read."
+            echo "::error::Version bilgisi okunamadı."
             exit 1
           fi
-          if ! [[ "$VERSION_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
-            echo "Unsafe versionName: $VERSION_NAME"
+          if ! [[ "$VERSION_NAME" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]]; then
+            echo "::error::Güvensiz versionName: $VERSION_NAME"
             exit 1
           fi
           echo "name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
@@ -128,21 +148,51 @@ jobs:
         run: |
           set -euo pipefail
           ENCODED_TAG=${TAG//\//%2F}
-          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${ENCODED_TAG}" >/dev/null 2>&1; then
-            echo "Tag already exists: $TAG"
+
+          HTTP_STATUS=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${ENCODED_TAG}" \
+            --silent -o /dev/null -w '%{http_code}' 2>/tmp/tag_check_err.txt || true)
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "::error::Tag zaten mevcut: $TAG. Tekrar yayınlamak için app/build.gradle.kts içindeki versionName / versionCode değerlerini artırın."
+            exit 1
+          elif [ -n "$HTTP_STATUS" ] && [ "$HTTP_STATUS" != "404" ]; then
+            echo "::error::Tag kontrolü beklenmedik şekilde başarısız oldu (HTTP $HTTP_STATUS). Ağ/izin sorunu olabilir, tekrar deneyin."
+            cat /tmp/tag_check_err.txt || true
             exit 1
           fi
+
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release already exists: $TAG"
+            echo "::error::Release zaten mevcut: $TAG"
             exit 1
           fi
+
+      - name: Run unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${{ steps.prep.outputs.gradle_root }}"
+          ${{ steps.gradlecmd.outputs.cmd }} test --stacktrace
 
       - name: Build signed release APK
         shell: bash
         run: |
           set -euo pipefail
           cd "${{ steps.prep.outputs.gradle_root }}"
-          gradle assembleRelease --stacktrace
+          mkdir -p "$GITHUB_WORKSPACE/build-report"
+          if ! ${{ steps.gradlecmd.outputs.cmd }} assembleRelease --stacktrace 2>&1 \
+              | tee "$GITHUB_WORKSPACE/build-report/gradle-release-full.log"; then
+            echo "::error::Release build başarısız oldu, build-report artifact'ine bakın."
+            exit 1
+          fi
+
+      - name: Upload release build log (yalnız hata durumunda)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LoganOS-release-build-log-${{ github.run_number }}
+          path: build-report/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Collect APK and checksum
         env:
@@ -203,6 +253,14 @@ jobs:
             --title "LoganOS v${VERSION_NAME}" \
             --notes "$RELEASE_NOTES" \
             "${EXTRA_ARGS[@]}"
+
+          {
+            echo "## LoganOS Release Yayınlandı 🎉"
+            echo ""
+            echo "- **Sürüm:** $VERSION_NAME"
+            echo "- **Tag:** $TAG"
+            echo "- **Commit:** $GITHUB_SHA"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove signing key from runner
         if: always()
