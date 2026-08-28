@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version_name:
-        description: "Sürüm örn: 1.0.0-beta.3.6.1"
+        description: "Sürüm örn: 1.0.0-beta.4.20.26"
         required: true
-        default: "1.0.0-beta.3.6.1"
+        default: "1.0.0-beta.4.20.26"
 
 jobs:
   build:
@@ -34,9 +34,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Repository files:"
-          find . -maxdepth 2 -type f | sort
-
           if [ -f "settings.gradle.kts" ] || [ -f "settings.gradle" ]; then
             echo "Gradle project found at repository root."
             echo "gradle_root=." >> "$GITHUB_OUTPUT"
@@ -62,8 +59,7 @@ jobs:
             | xargs dirname)
 
           if [ -z "$GRADLE_ROOT" ]; then
-            echo "No settings.gradle or settings.gradle.kts found inside ZIP."
-            find extracted -maxdepth 4 -type f | sort
+            echo "No Gradle project found inside ZIP."
             exit 1
           fi
 
@@ -77,58 +73,60 @@ jobs:
         run: |
           set -o pipefail
 
-          cd "${{ steps.prep.outputs.gradle_root }}"
-
           mkdir -p "$GITHUB_WORKSPACE/build-report"
 
-          echo "LoganOS APK Build Report" > "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-          echo "========================================" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-          echo "Version: ${{ github.event.inputs.version_name }}" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-          echo "Workflow: ${{ github.workflow }}" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-          echo "Run: ${{ github.run_number }}" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-          echo "" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
+          cd "${{ steps.prep.outputs.gradle_root }}"
 
-          gradle assembleDebug --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/build-report/gradle-full.log"
+          {
+            echo "LoganOS APK Build Report"
+            echo "========================"
+            echo "Version: ${{ github.event.inputs.version_name }}"
+            echo "Workflow: ${{ github.workflow }}"
+            echo "Run: ${{ github.run_number }}"
+            echo "Commit: ${{ github.sha }}"
+            echo ""
+          } > "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
+
+          gradle assembleDebug --stacktrace 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build-report/gradle-full.log"
 
           BUILD_EXIT=${PIPESTATUS[0]}
 
           if [ "$BUILD_EXIT" -ne 0 ]; then
-            echo "BUILD RESULT: FAIL" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-            echo "" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-
-            echo "===== COMPILATION ERRORS =====" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-
-            grep -E \
-              '(^e: |^[^ ]+\.kt:[0-9]+:[0-9]+|Execution failed|What went wrong|FAILURE: Build failed)' \
-              "$GITHUB_WORKSPACE/build-report/gradle-full.log" \
-              >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt" || true
-
-            echo "" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-            echo "===== FULL GRADLE LOG =====" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-
-            cat "$GITHUB_WORKSPACE/build-report/gradle-full.log" \
-              >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
+            {
+              echo ""
+              echo "BUILD RESULT: FAIL"
+              echo ""
+              echo "===== COMPILATION / GRADLE ERRORS ====="
+              grep -E \
+                '(^e: |^[^ ]+\.kt:[0-9]+:[0-9]+|Execution failed|What went wrong|FAILURE: Build failed)' \
+                "$GITHUB_WORKSPACE/build-report/gradle-full.log" || true
+              echo ""
+              echo "===== FULL GRADLE LOG ====="
+              cat "$GITHUB_WORKSPACE/build-report/gradle-full.log"
+            } >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
 
             exit "$BUILD_EXIT"
           fi
 
-          echo "BUILD RESULT: PASS" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
+          echo "BUILD RESULT: PASS" \
+            >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
 
-      - name: Upload build error report
+      - name: Upload build report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: LoganOS-build-report-${{ github.run_number }}
           path: build-report/
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 30
 
       - name: Fail workflow if build failed
         if: steps.build.outcome == 'failure'
         shell: bash
         run: |
           echo "LoganOS APK build failed."
-          echo "Download the 'LoganOS-build-report-${{ github.run_number }}' artifact."
+          echo "Download the LoganOS-build-report-${{ github.run_number }} artifact."
           exit 1
 
       - name: Rename APK
@@ -139,8 +137,14 @@ jobs:
 
           mkdir -p dist
 
-          cp \
-            "${{ steps.prep.outputs.gradle_root }}/app/build/outputs/apk/debug/app-debug.apk" \
+          APK="${{ steps.prep.outputs.gradle_root }}/app/build/outputs/apk/debug/app-debug.apk"
+
+          if [ ! -f "$APK" ]; then
+            echo "APK not found: $APK"
+            exit 1
+          fi
+
+          cp "$APK" \
             "dist/LoganOS-v${{ github.event.inputs.version_name }}-debug.apk"
 
       - name: Upload APK
@@ -149,3 +153,4 @@ jobs:
         with:
           name: LoganOS-v${{ github.event.inputs.version_name }}-apk
           path: dist/LoganOS-v${{ github.event.inputs.version_name }}-debug.apk
+          if-no-files-found: error
