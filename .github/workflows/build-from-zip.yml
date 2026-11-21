@@ -35,8 +35,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      SOURCE_ZIP_INPUT: ${{ inputs.source_zip || '' }}
-      EXPECTED_SHA256_INPUT: ${{ inputs.expected_sha256 || '' }}
+      SOURCE_ZIP_INPUT: ${{ github.event.inputs.source_zip || '' }}
+      EXPECTED_SHA256_INPUT: ${{ github.event.inputs.expected_sha256 || '' }}
 
     steps:
       - name: Checkout repository
