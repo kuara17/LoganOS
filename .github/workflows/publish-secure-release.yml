@@ -74,7 +74,7 @@ jobs:
             echo "Preparing LoganOS source..."
             if [[ -f "settings.gradle.kts" || -f "settings.gradle" ]]; then
               if [[ -n "$SOURCE_ZIP_INPUT" ]]; then
-                echo "::error::A Gradle project exists at repository root; source_zip was supplied and would be ignored. Clear source_zip or remove the root project." 
+                echo "::error::A Gradle project exists at repository root; source_zip was supplied and would be ignored. Clear source_zip or remove the root project."
                 exit 1
               fi
               echo "Gradle project found at repository root."
@@ -408,12 +408,12 @@ jobs:
           log_path.write_text(content, encoding="utf-8")
           PY
           then
-            # Fail closed: do not leave a raw log eligible for artifact upload.
             rm -f "$LOG" || true
             : > "$MARKER"
             echo "::error::Diagnostics redaction failed; raw log was discarded and will not be uploaded."
             exit 1
           fi
+
       - name: Create release failure report
         if: always()
         id: report
@@ -462,4 +462,34 @@ jobs:
             echo "Redact diagnostics: ${REDACT_OUTCOME:-not-run}"
             echo
             echo "=== Captured Gradle / workflow diagnostics ==="
-            if [[ -f
+            MARKER="$RUNNER_TEMP/loganos-redaction-failed"
+            if [[ -f "$MARKER" ]]; then
+              echo "Redaction failed. Raw command log was discarded; only this safe step-outcome summary is retained."
+            elif [[ "${REDACT_OUTCOME:-}" == "success" && ! -f "$MARKER" && -s "$LOG" ]]; then
+              tail -n 300 "$LOG"
+            else
+              echo "No captured command output, or redacted log is empty. Failure may have occurred before log initialization."
+            fi
+          } > "${REPORT}.tmp"
+          mv -f "${REPORT}.tmp" "$REPORT"
+          echo "Diagnostic report created."
+
+      - name: Upload redacted release diagnostics
+        if: always() && steps.redact.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: loganos-release-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/LoganOS_Release_Error_Report.txt
+            ${{ runner.temp }}/loganos-gradle-output.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload safe summary only (redaction failed)
+        if: always() && steps.redact.outcome != 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: loganos-release-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/LoganOS_Release_Error_Report.txt
+          if-no-files-found: warn
+          retention-days: 14
