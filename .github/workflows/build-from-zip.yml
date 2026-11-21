@@ -186,6 +186,6 @@ jobs:
           {
             echo ""
             echo "## Validation result"
-            echo "- Unit tests + debug APK: \`${{ steps.validation.outcome || 'not-run' }\`"
-            echo "- Workflow run: \`${{ github.run_id }\` / attempt \`${{ github.run_attempt }\`"
+            echo "- Unit tests + debug APK: \`${{ steps.validation.outcome || 'not-run' }}\`"
+            echo "- Workflow run: \`${{ github.run_id }}\` / attempt \`${{ github.run_attempt }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
