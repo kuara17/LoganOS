@@ -163,6 +163,24 @@ jobs:
             echo "tag=v$VERSION_NAME" >> "$GITHUB_OUTPUT"
           } 2>&1 | tee -a "$LOG"
 
+      - name: Enforce production signer pin configuration
+        id: signer_pin
+        env:
+          EXPECTED_SIGNER_SHA256: ${{ vars.LOGANOS_EXPECTED_SIGNER_SHA256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PIN="$(printf '%s' "${EXPECTED_SIGNER_SHA256:-}" | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
+          if [[ -z "$PIN" ]]; then
+            echo "::error::LOGANOS_EXPECTED_SIGNER_SHA256 is required for production releases; refusing to continue."
+            exit 1
+          fi
+          if ! [[ "$PIN" =~ ^[a-f0-9]{64}$ ]]; then
+            echo "::error::LOGANOS_EXPECTED_SIGNER_SHA256 must be a 64-character SHA-256 fingerprint (colons are optional)."
+            exit 1
+          fi
+          echo "Production signer pin is configured and has a valid SHA-256 format."
+
       - name: Validate release signing secrets and materialize keystore
         id: signing
         shell: bash
@@ -277,22 +295,26 @@ jobs:
             grep -Fq "package: name='com.dcui.loganos'" "$BADGING"
             grep -Fq "versionCode='${VERSION_CODE}'" "$BADGING"
             grep -Fq "versionName='${VERSION_NAME}'" "$BADGING"
-
-            if [[ -n "${EXPECTED_SIGNER_SHA256:-}" ]]; then
-              EXPECTED="$(printf '%s' "$EXPECTED_SIGNER_SHA256" | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
-              if ! [[ "$EXPECTED" =~ ^[a-f0-9]{64}$ ]]; then
-                echo "::error::LOGANOS_EXPECTED_SIGNER_SHA256 must be a 64-character SHA-256 fingerprint (colons are optional)."
-                exit 1
-              fi
-              ACTUAL="$(sed -nE -e 's/^Signer #1 certificate SHA-256 digest:[[:space:]]*//p' -e 's/^V[0-9]+([.][0-9]+)? Signer: certificate SHA-256 digest:[[:space:]]*//p' "$CERT_FILE" | head -n 1 | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
-              if [[ -z "$ACTUAL" || "$ACTUAL" != "$EXPECTED" ]]; then
-                echo "::error::APK signer certificate fingerprint does not match LOGANOS_EXPECTED_SIGNER_SHA256."
-                exit 1
-              fi
-              echo "Production signer SHA-256 fingerprint matches the configured pin."
-            else
-              echo "::warning::LOGANOS_EXPECTED_SIGNER_SHA256 is not configured; signer pinning was skipped. Existing-device OTA signature continuity checks remain in the client."
+            if ! grep -Fq "sdkVersion='26'" "$BADGING"; then
+              echo "::error::APK minSdk must be 26 (sdkVersion='26')."
+              exit 1
             fi
+            if ! grep -Fq "targetSdkVersion='35'" "$BADGING"; then
+              echo "::error::APK targetSdk must be 35 (targetSdkVersion='35')."
+              exit 1
+            fi
+
+            EXPECTED="$(printf '%s' "${EXPECTED_SIGNER_SHA256:-}" | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
+            if ! [[ "$EXPECTED" =~ ^[a-f0-9]{64}$ ]]; then
+              echo "::error::LOGANOS_EXPECTED_SIGNER_SHA256 is missing or invalid; refusing to publish."
+              exit 1
+            fi
+            ACTUAL="$(sed -nE -e 's/^Signer #1 certificate SHA-256 digest:[[:space:]]*//p' -e 's/^V[0-9]+([.][0-9]+)? Signer: certificate SHA-256 digest:[[:space:]]*//p' "$CERT_FILE" | head -n 1 | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
+            if [[ -z "$ACTUAL" || "$ACTUAL" != "$EXPECTED" ]]; then
+              echo "::error::APK signer certificate fingerprint does not match LOGANOS_EXPECTED_SIGNER_SHA256."
+              exit 1
+            fi
+            echo "Production signer SHA-256 fingerprint matches the configured pin."
             echo "APK signature, package id, versionName and versionCode verified."
           } 2>&1 | tee -a "$LOG"
 
