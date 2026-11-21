@@ -26,7 +26,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: loganos-android-validation-${ github.ref }}
+  group: loganos-android-validation-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -35,8 +35,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      SOURCE_ZIP_INPUT: ${ inputs.source_zip || '' }}
-      EXPECTED_SHA256_INPUT: ${ inputs.expected_sha256 || '' }}
+      SOURCE_ZIP_INPUT: ${{ inputs.source_zip || '' }}
+      EXPECTED_SHA256_INPUT: ${{ inputs.expected_sha256 || '' }}
 
     steps:
       - name: Checkout repository
@@ -137,7 +137,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Generate checksum-pinned Gradle 8.9 Wrapper
-        working-directory: ${ steps.prepare.outputs.gradle_root }}
+        working-directory: ${{ steps.prepare.outputs.gradle_root }}
         shell: bash
         run: |
           set -euo pipefail
@@ -148,7 +148,7 @@ jobs:
 
       - name: Run unit tests and assemble debug APK
         id: validation
-        working-directory: ${ steps.prepare.outputs.gradle_root }}
+        working-directory: ${{ steps.prepare.outputs.gradle_root }}
         shell: bash
         run: |
           set -euo pipefail
@@ -162,11 +162,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: loganos-validation-reports-${ github.run_id }}-${ github.run_attempt }}
+          name: loganos-validation-reports-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             gradle-validation.log
-            ${ steps.prepare.outputs.gradle_root }}/app/build/reports/tests/testDebugUnitTest/
-            ${ steps.prepare.outputs.gradle_root }}/app/build/test-results/testDebugUnitTest/
+            ${{ steps.prepare.outputs.gradle_root }}/app/build/reports/tests/testDebugUnitTest/
+            ${{ steps.prepare.outputs.gradle_root }}/app/build/test-results/testDebugUnitTest/
           if-no-files-found: warn
           retention-days: 14
 
@@ -174,8 +174,8 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: loganos-debug-apk-${ github.run_id }}-${ github.run_attempt }}
-          path: ${ steps.prepare.outputs.gradle_root }}/app/build/outputs/apk/debug/*.apk
+          name: loganos-debug-apk-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.prepare.outputs.gradle_root }}/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14
 
@@ -186,6 +186,6 @@ jobs:
           {
             echo ""
             echo "## Validation result"
-            echo "- Unit tests + debug APK: \`${ steps.validation.outcome || 'not-run' }\`"
-            echo "- Workflow run: \`${ github.run_id }\` / attempt \`${ github.run_attempt }\`"
+            echo "- Unit tests + debug APK: \`${{ steps.validation.outcome || 'not-run' }\`"
+            echo "- Workflow run: \`${{ github.run_id }\` / attempt \`${{ github.run_attempt }\`"
           } >> "$GITHUB_STEP_SUMMARY"
