@@ -1,151 +1,191 @@
-name: Build APK Manual
+name: Android Source Validation
 
 on:
+  push:
+    paths:
+      - "*.zip"
+      - ".github/workflows/build-from-zip.yml"
+  pull_request:
+    paths:
+      - "*.zip"
+      - ".github/workflows/build-from-zip.yml"
   workflow_dispatch:
     inputs:
-      version_name:
-        description: "Sürüm örn: 1.0.0-beta.3.6.1"
-        required: true
-        default: "1.0.0-beta.3.6.1"
+      source_zip:
+        description: "Repository-relative source ZIP path (leave empty only when exactly one ZIP exists)"
+        required: false
+        type: string
+        default: ""
+      expected_sha256:
+        description: "Optional expected SHA-256 of the selected source ZIP"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: loganos-android-validation-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build LoganOS APK
+  validate:
+    name: Unit tests and debug APK
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SOURCE_ZIP_INPUT: ${{ github.event.inputs.source_zip || '' }}
+      EXPECTED_SHA256_INPUT: ${{ github.event.inputs.expected_sha256 || '' }}
 
     steps:
-      - name: Checkout project
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: "17"
 
-      - name: Set up Gradle
+      - name: Set up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.10.2
+          gradle-version: "8.9"
 
-      - name: Prepare source
-        id: prep
+      - name: Prepare and identify source
+        id: prepare
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Repository files:"
-          find . -maxdepth 2 -type f | sort
+          if [[ -f "settings.gradle.kts" || -f "settings.gradle" ]]; then
+            GRADLE_ROOT="$GITHUB_WORKSPACE"
+            SOURCE_ZIP=""
+            SOURCE_SHA256="source-tree"
+          else
+            SOURCE_ZIP="$SOURCE_ZIP_INPUT"
 
-          if [ -f "settings.gradle.kts" ] || [ -f "settings.gradle" ]; then
-            echo "Gradle project found at repository root."
-            echo "gradle_root=." >> "$GITHUB_OUTPUT"
-            exit 0
+            if [[ -z "$SOURCE_ZIP" ]]; then
+              mapfile -t ZIP_CANDIDATES < <(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -name "*.zip" -printf "%f\n" | sort)
+              if [[ "${#ZIP_CANDIDATES[@]}" -ne 1 ]]; then
+                echo "::error::Expected exactly one root-level source ZIP, found ${#ZIP_CANDIDATES[@]}. Set workflow_dispatch input source_zip explicitly."
+                printf 'Candidate: %s\n' "${ZIP_CANDIDATES[@]}"
+                exit 1
+              fi
+              SOURCE_ZIP="${ZIP_CANDIDATES[0]}"
+            fi
+
+            if [[ "$SOURCE_ZIP" = /* || ! -f "$GITHUB_WORKSPACE/$SOURCE_ZIP" ]]; then
+              echo "::error::source_zip must be a repository-relative path to an existing file."
+              exit 1
+            fi
+
+            SOURCE_SHA256="$(sha256sum "$GITHUB_WORKSPACE/$SOURCE_ZIP" | awk '{print $1}')"
+            if [[ -n "$EXPECTED_SHA256_INPUT" ]]; then
+              EXPECTED_SHA256="$(printf '%s' "$EXPECTED_SHA256_INPUT" | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
+              if ! [[ "$EXPECTED_SHA256" =~ ^[a-f0-9]{64}$ ]]; then
+                echo "::error::expected_sha256 must contain exactly 64 hexadecimal characters."
+                exit 1
+              fi
+              if [[ "$SOURCE_SHA256" != "$EXPECTED_SHA256" ]]; then
+                echo "::error::Source ZIP SHA-256 does not match expected_sha256."
+                exit 1
+              fi
+            fi
+
+            SOURCE_DIR="$RUNNER_TEMP/loganos-source"
+            rm -rf "$SOURCE_DIR"
+            mkdir -p "$SOURCE_DIR"
+            unzip -q "$GITHUB_WORKSPACE/$SOURCE_ZIP" -d "$SOURCE_DIR"
+
+            mapfile -t SETTINGS_FILES < <(find "$SOURCE_DIR" -type f \( -name "settings.gradle.kts" -o -name "settings.gradle" \) -not -path "*/.gradle/*" | sort)
+            if [[ "${#SETTINGS_FILES[@]}" -ne 1 ]]; then
+              echo "::error::Expected exactly one Gradle settings file in the source ZIP, found ${#SETTINGS_FILES[@]}."
+              printf 'Settings file: %s\n' "${SETTINGS_FILES[@]}"
+              exit 1
+            fi
+            GRADLE_ROOT="$(dirname "${SETTINGS_FILES[0]}")"
           fi
 
-          ZIP_FILE=$(find . -maxdepth 2 -type f -name "*.zip" | sort | tail -n 1)
-
-          if [ -z "$ZIP_FILE" ]; then
-            echo "No Gradle project and no ZIP file found."
+          if [[ ! -f "$GRADLE_ROOT/app/build.gradle.kts" ]]; then
+            echo "::error::app/build.gradle.kts was not found under the selected Gradle root."
             exit 1
           fi
 
-          echo "Using ZIP: $ZIP_FILE"
-
-          rm -rf extracted
-          mkdir -p extracted
-          unzip -q "$ZIP_FILE" -d extracted
-
-          GRADLE_ROOT=$(find extracted -type f \
-            \( -name "settings.gradle.kts" -o -name "settings.gradle" \) \
-            | head -n 1 \
-            | xargs dirname)
-
-          if [ -z "$GRADLE_ROOT" ]; then
-            echo "No settings.gradle or settings.gradle.kts found inside ZIP."
-            find extracted -maxdepth 4 -type f | sort
+          VERSION_NAME="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$GRADLE_ROOT/app/build.gradle.kts" | head -n 1)"
+          VERSION_CODE="$(sed -nE 's/^[[:space:]]*versionCode[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' "$GRADLE_ROOT/app/build.gradle.kts" | head -n 1)"
+          if [[ -z "$VERSION_NAME" || -z "$VERSION_CODE" ]]; then
+            echo "::error::Could not read versionName/versionCode from app/build.gradle.kts."
             exit 1
           fi
 
-          echo "Gradle project found at: $GRADLE_ROOT"
-          echo "gradle_root=$GRADLE_ROOT" >> "$GITHUB_OUTPUT"
+          {
+            echo "gradle_root=$GRADLE_ROOT"
+            echo "source_zip=$SOURCE_ZIP"
+            echo "source_sha256=$SOURCE_SHA256"
+            echo "version_name=$VERSION_NAME"
+            echo "version_code=$VERSION_CODE"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Build debug APK
-        id: build
-        continue-on-error: true
+          {
+            echo "## LoganOS source validation"
+            echo "- Source ZIP: \`${SOURCE_ZIP:-repository Gradle project}\`"
+            echo "- Source SHA-256: \`$SOURCE_SHA256\`"
+            echo "- Version: \`$VERSION_NAME\` (\`$VERSION_CODE\`)"
+            echo "- Gradle root: \`$GRADLE_ROOT\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate checksum-pinned Gradle 8.9 Wrapper
+        working-directory: ${{ steps.prepare.outputs.gradle_root }}
         shell: bash
         run: |
+          set -euo pipefail
+          gradle --no-daemon wrapper \
+            --gradle-version 8.9 \
+            --distribution-type bin \
+            --gradle-distribution-sha256-sum=d725d707bfabd4dfdc958c624003b3c80accc03f7037b5122c4b1d0ef15cecab
+
+      - name: Run unit tests and assemble debug APK
+        id: validation
+        working-directory: ${{ steps.prepare.outputs.gradle_root }}
+        shell: bash
+        run: |
+          set -euo pipefail
           set -o pipefail
+          ./gradlew --no-daemon --stacktrace \
+            :app:testDebugUnitTest \
+            :app:assembleDebug \
+            2>&1 | tee "$GITHUB_WORKSPACE/gradle-validation.log"
 
-          cd "${{ steps.prep.outputs.gradle_root }}"
-
-          mkdir -p "$GITHUB_WORKSPACE/build-report"
-
-          echo "LoganOS APK Build Report" > "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-          echo "========================================" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-          echo "Version: ${{ github.event.inputs.version_name }}" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-          echo "Workflow: ${{ github.workflow }}" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-          echo "Run: ${{ github.run_number }}" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-          echo "" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-
-          gradle assembleDebug --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/build-report/gradle-full.log"
-
-          BUILD_EXIT=${PIPESTATUS[0]}
-
-          if [ "$BUILD_EXIT" -ne 0 ]; then
-            echo "BUILD RESULT: FAIL" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-            echo "" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-
-            echo "===== COMPILATION ERRORS =====" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-
-            grep -E \
-              '(^e: |^[^ ]+\.kt:[0-9]+:[0-9]+|Execution failed|What went wrong|FAILURE: Build failed)' \
-              "$GITHUB_WORKSPACE/build-report/gradle-full.log" \
-              >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt" || true
-
-            echo "" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-            echo "===== FULL GRADLE LOG =====" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-
-            cat "$GITHUB_WORKSPACE/build-report/gradle-full.log" \
-              >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-
-            exit "$BUILD_EXIT"
-          fi
-
-          echo "BUILD RESULT: PASS" >> "$GITHUB_WORKSPACE/build-report/loganos-build-error.txt"
-
-      - name: Upload build error report
+      - name: Upload test reports and Gradle log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: LoganOS-build-report-${{ github.run_number }}
-          path: build-report/
+          name: loganos-validation-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            gradle-validation.log
+            ${{ steps.prepare.outputs.gradle_root }}/app/build/reports/tests/testDebugUnitTest/
+            ${{ steps.prepare.outputs.gradle_root }}/app/build/test-results/testDebugUnitTest/
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Fail workflow if build failed
-        if: steps.build.outcome == 'failure'
-        shell: bash
-        run: |
-          echo "LoganOS APK build failed."
-          echo "Download the 'LoganOS-build-report-${{ github.run_number }}' artifact."
-          exit 1
-
-      - name: Rename APK
-        if: steps.build.outcome == 'success'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p dist
-
-          cp \
-            "${{ steps.prep.outputs.gradle_root }}/app/build/outputs/apk/debug/app-debug.apk" \
-            "dist/LoganOS-v${{ github.event.inputs.version_name }}-debug.apk"
-
-      - name: Upload APK
-        if: steps.build.outcome == 'success'
+      - name: Upload debug APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: LoganOS-v${{ github.event.inputs.version_name }}-apk
-          path: dist/LoganOS-v${{ github.event.inputs.version_name }}-debug.apk
+          name: loganos-debug-apk-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.prepare.outputs.gradle_root }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Record validation result
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo ""
+            echo "## Validation result"
+            echo "- Unit tests + debug APK: \`${{ steps.validation.outcome || 'not-run' }}\`"
+            echo "- Workflow run: \`${{ github.run_id }}\` / attempt \`${{ github.run_attempt }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
