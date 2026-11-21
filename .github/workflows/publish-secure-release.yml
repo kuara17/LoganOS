@@ -284,7 +284,7 @@ jobs:
                 echo "::error::LOGANOS_EXPECTED_SIGNER_SHA256 must be a 64-character SHA-256 fingerprint (colons are optional)."
                 exit 1
               fi
-              ACTUAL="$(sed -n 's/^Signer #1 certificate SHA-256 digest: *//p' "$CERT_FILE" | head -n 1 | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
+              ACTUAL="$(sed -nE -e 's/^Signer #1 certificate SHA-256 digest:[[:space:]]*//p' -e 's/^V[0-9]+([.][0-9]+)? Signer: certificate SHA-256 digest:[[:space:]]*//p' "$CERT_FILE" | head -n 1 | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
               if [[ -z "$ACTUAL" || "$ACTUAL" != "$EXPECTED" ]]; then
                 echo "::error::APK signer certificate fingerprint does not match LOGANOS_EXPECTED_SIGNER_SHA256."
                 exit 1
