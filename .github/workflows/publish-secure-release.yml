@@ -4,9 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       release_notes:
-        description: Sürüm notları
-        required: true
+        description: "İsteğe bağlı yayın notu geçersiz kılma; boş bırakılırsa kaynak ZIP içindeki yerelleştirilmiş OTA notları kullanılır."
+        required: false
         type: string
+        default: ""
       confirm:
         description: Yayınlamak için tam olarak PUBLISH yaz
         required: true
@@ -295,12 +296,12 @@ jobs:
             grep -Fq "package: name='com.dcui.loganos'" "$BADGING"
             grep -Fq "versionCode='${VERSION_CODE}'" "$BADGING"
             grep -Fq "versionName='${VERSION_NAME}'" "$BADGING"
-            if ! grep -Fq "sdkVersion='26'" "$BADGING"; then
-              echo "::error::APK minSdk must be 26 (sdkVersion='26')."
+            if ! grep -Fq "sdkVersion:'26'" "$BADGING"; then
+              echo "::error::APK minSdk must be 26 (sdkVersion:'26')."
               exit 1
             fi
-            if ! grep -Fq "targetSdkVersion='35'" "$BADGING"; then
-              echo "::error::APK targetSdk must be 35 (targetSdkVersion='35')."
+            if ! grep -Fq "targetSdkVersion:'35'" "$BADGING"; then
+              echo "::error::APK targetSdk must be 35 (targetSdkVersion:'35')."
               exit 1
             fi
 
@@ -330,13 +331,46 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
           VERSION_NAME: ${{ steps.version.outputs.name }}
-          RELEASE_NOTES: ${{ inputs.release_notes }}
+          RELEASE_NOTES_INPUT: ${{ inputs.release_notes }}
+          GRADLE_ROOT: ${{ steps.prep.outputs.gradle_root }}
           OVERRIDE_EXISTING: ${{ inputs.override_existing }}
         shell: bash
         run: |
           set -euo pipefail
           LOG="$RUNNER_TEMP/loganos-gradle-output.txt"
           {
+          RELEASE_NOTES="$RELEASE_NOTES_INPUT"
+          if [[ -z "$RELEASE_NOTES" ]]; then
+            NOTES_DIR="$GRADLE_ROOT/docs"
+            mapfile -t NOTES_FILES < <(find "$NOTES_DIR" -maxdepth 1 -type f -name 'OTA_RELEASE_NOTES*.md' -print | sort)
+            if [[ "${#NOTES_FILES[@]}" -ne 1 ]]; then
+              echo "::error::Leave release_notes blank only when exactly one docs/OTA_RELEASE_NOTES*.md file exists; found ${#NOTES_FILES[@]}."
+              exit 1
+            fi
+            NOTES_FILE="${NOTES_FILES[0]}"
+            if grep -Fq '<!-- LOGANOS_NOTES_TR_START -->' "$NOTES_FILE"; then
+              EXTRACTED_NOTES="$RUNNER_TEMP/loganos-release-notes.md"
+              if ! awk '
+                /<!-- LOGANOS_NOTES_TR_START -->/ { copying=1 }
+                copying { print }
+                /<!-- LOGANOS_NOTES_EN_END -->/ { found_end=1; exit }
+                END { if (!copying || !found_end) exit 1 }
+              ' "$NOTES_FILE" > "$EXTRACTED_NOTES"; then
+                echo "::error::Localized release-note markers are incomplete in $NOTES_FILE."
+                exit 1
+              fi
+              RELEASE_NOTES="$(cat "$EXTRACTED_NOTES")"
+            else
+              RELEASE_NOTES="$(cat "$NOTES_FILE")"
+            fi
+            echo "Using release notes from source: $NOTES_FILE"
+          else
+            echo "Using explicitly supplied release_notes workflow input."
+          fi
+          if [[ -z "$RELEASE_NOTES" ]]; then
+            echo "::error::Release notes are empty; refusing to publish."
+            exit 1
+          fi
           APK="dist/LoganOS-v${VERSION_NAME}-release.apk"
           SHA="${APK}.sha256"
           CERT="dist/LoganOS-v${VERSION_NAME}-release.certificate.txt"
