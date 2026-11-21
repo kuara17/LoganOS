@@ -12,15 +12,21 @@ on:
         required: true
         type: string
       override_existing:
-        description: "Var olan sürümün/etiketin üzerine yazılsın mı?"
+        description: "Mevcut GitHub Release varlıkları yeni ve doğrulanmış APK ile değiştirilsin mi?"
         required: false
         type: boolean
         default: false
+      source_zip:
+        description: "Gradle projesi repo kökünde değilse kullanılacak ZIP yolu (ör. releases/LoganOS-source.zip)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
   id-token: write
   attestations: write
+  artifact-metadata: write
 
 concurrency:
   group: loganos-production-release
@@ -31,195 +37,429 @@ jobs:
     name: Build, verify and publish signed APK
     if: inputs.confirm == 'PUBLISH'
     runs-on: ubuntu-latest
-
-    # Bu environment GitHub Settings > Environments altında oluşturulmalı.
-    # İmzalama secret'ları yalnız burada tutulmalı ve mümkünse Required reviewers açılmalı.
     environment: release-signing
 
     steps:
       - name: Checkout exact source
+        id: checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: Set up JDK 17
+        id: java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
 
-      - name: Set up Gradle
+      - name: Set up Gradle 8.9
+        id: gradle_setup
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.10.2
+          gradle-version: '8.9'
 
       - name: Prepare source
         id: prep
         shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ -f "settings.gradle.kts" ] || [ -f "settings.gradle" ]; then
-            echo "gradle_root=." >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          ZIP_FILE=$(find . -maxdepth 2 -type f -name "*.zip" | sort -V | tail -n 1)
-          if [ -z "$ZIP_FILE" ]; then
-            echo "No Gradle project and no source ZIP found."
-            exit 1
-          fi
-
-          rm -rf extracted
-          mkdir -p extracted
-          unzip -q "$ZIP_FILE" -d extracted
-          SETTINGS_FILE=$(find extracted -type f \( -name "settings.gradle.kts" -o -name "settings.gradle" \) | head -n 1)
-          if [ -z "$SETTINGS_FILE" ]; then
-            echo "No Gradle settings file found inside ZIP."
-            exit 1
-          fi
-          echo "gradle_root=$(dirname "$SETTINGS_FILE")" >> "$GITHUB_OUTPUT"
-
-      - name: Prepare release signing key
-        shell: bash
         env:
-          KEYSTORE_B64: ${{ secrets.LOGANOS_KEYSTORE_BASE64 }}
-          STORE_PASSWORD: ${{ secrets.LOGANOS_STORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.LOGANOS_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.LOGANOS_KEY_PASSWORD }}
+          SOURCE_ZIP_INPUT: ${{ inputs.source_zip }}
         run: |
           set -euo pipefail
-          for value in "$KEYSTORE_B64" "$STORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD"; do
-            if [ -z "$value" ]; then
-              echo "Release-signing environment secrets are incomplete."
+          LOG="$RUNNER_TEMP/loganos-gradle-output.txt"
+          mkdir -p "$(dirname "$LOG")"
+
+          {
+            echo "Preparing LoganOS source..."
+            if [[ -f "settings.gradle.kts" || -f "settings.gradle" ]]; then
+              if [[ -n "$SOURCE_ZIP_INPUT" ]]; then
+                echo "::error::A Gradle project exists at repository root; source_zip was supplied and would be ignored. Clear source_zip or remove the root project." 
+                exit 1
+              fi
+              echo "Gradle project found at repository root."
+              echo "gradle_root=." >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if [[ -n "$SOURCE_ZIP_INPUT" ]]; then
+              ZIP_FILE="$SOURCE_ZIP_INPUT"
+              if [[ ! -f "$ZIP_FILE" ]]; then
+                echo "::error::Specified source ZIP does not exist: $ZIP_FILE"
+                exit 1
+              fi
+            else
+              mapfile -t ZIP_FILES < <(find . -maxdepth 2 -type f -name '*.zip' -not -path './.git/*' | sort)
+              if [[ "${#ZIP_FILES[@]}" -ne 1 ]]; then
+                echo "::error::Expected exactly one source ZIP when no Gradle project is at repository root; found ${#ZIP_FILES[@]}. Set the source_zip workflow input to the intended file."
+                printf 'Candidate: %s\n' "${ZIP_FILES[@]}"
+                exit 1
+              fi
+              ZIP_FILE="${ZIP_FILES[0]}"
+            fi
+
+            ZIP_REAL="$(realpath -e "$ZIP_FILE")"
+            WORKSPACE_REAL="$(realpath -e "$GITHUB_WORKSPACE")"
+            case "$ZIP_REAL" in
+              "$WORKSPACE_REAL"/*) ;;
+              *)
+                echo "::error::source_zip must point to a file inside the checked-out repository."
+                exit 1
+                ;;
+            esac
+
+            echo "Using explicitly selected source ZIP: $ZIP_FILE"
+            rm -rf extracted
+            mkdir -p extracted
+            unzip -q "$ZIP_FILE" -d extracted
+            mapfile -t SETTINGS_FILES < <(find extracted -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) | sort)
+            if [[ "${#SETTINGS_FILES[@]}" -ne 1 ]]; then
+              echo "::error::Expected exactly one Gradle settings file inside source ZIP; found ${#SETTINGS_FILES[@]}."
+              printf 'Settings file: %s\n' "${SETTINGS_FILES[@]}"
               exit 1
             fi
-          done
-          KEYSTORE_PATH="$RUNNER_TEMP/loganos-release.jks"
-          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$KEYSTORE_PATH"
-          chmod 600 "$KEYSTORE_PATH"
-          echo "LOGANOS_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
-          echo "LOGANOS_STORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
-          echo "LOGANOS_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
-          echo "LOGANOS_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            GRADLE_ROOT="$(dirname "${SETTINGS_FILES[0]}")"
+            echo "Gradle project found at: $GRADLE_ROOT"
+            echo "gradle_root=$GRADLE_ROOT" >> "$GITHUB_OUTPUT"
+          } 2>&1 | tee -a "$LOG"
+
+      - name: Generate checksum-pinned Gradle Wrapper
+        id: wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${{ steps.prep.outputs.gradle_root }}"
+          gradle --no-daemon wrapper \
+            --gradle-version 8.9 \
+            --distribution-type bin \
+            --gradle-distribution-sha256-sum=d725d707bfabd4dfdc958c624003b3c80accc03f7037b5122c4b1d0ef15cecab \
+            2>&1 | tee -a "$RUNNER_TEMP/loganos-gradle-output.txt"
 
       - name: Read app version
         id: version
         shell: bash
         run: |
           set -euo pipefail
-          GRADLE_FILE="${{ steps.prep.outputs.gradle_root }}/app/build.gradle.kts"
-          VERSION_NAME=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' "$GRADLE_FILE" | head -n 1)
-          VERSION_CODE=$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' "$GRADLE_FILE" | head -n 1)
-          if [ -z "$VERSION_NAME" ] || [ -z "$VERSION_CODE" ]; then
-            echo "Version metadata could not be read."
-            exit 1
-          fi
-          if ! [[ "$VERSION_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
-            echo "Unsafe versionName: $VERSION_NAME"
-            exit 1
-          fi
-          echo "name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
-          echo "code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION_NAME" >> "$GITHUB_OUTPUT"
-
-      - name: Refuse or Override duplicate tag/release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
-          OVERRIDE: ${{ inputs.override_existing }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          ENCODED_TAG=${TAG//\//%2F}
-          
-          TAG_EXISTS=false
-          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${ENCODED_TAG}" >/dev/null 2>&1; then
-            TAG_EXISTS=true
-          fi
-          
-          if [ "$TAG_EXISTS" = true ]; then
-            if [ "$OVERRIDE" = "true" ]; then
-              echo "Overriding existing tag and release: $TAG"
-              gh release delete "$TAG" -y --cleanup-tag || true
-              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${ENCODED_TAG}" >/dev/null 2>&1 || true
-            else
-              echo "Tag already exists: $TAG"
-              echo "To overwrite, check the 'override_existing' box when triggering the workflow."
+          LOG="$RUNNER_TEMP/loganos-gradle-output.txt"
+          {
+            GRADLE_FILE="${{ steps.prep.outputs.gradle_root }}/app/build.gradle.kts"
+            if [[ ! -f "$GRADLE_FILE" ]]; then
+              echo "::error::app/build.gradle.kts was not found."
               exit 1
             fi
+            VERSION_NAME="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' "$GRADLE_FILE" | head -n 1)"
+            VERSION_CODE="$(sed -n 's/.*versionCode = \([0-9][0-9]*\).*/\1/p' "$GRADLE_FILE" | head -n 1)"
+            if [[ -z "$VERSION_NAME" || -z "$VERSION_CODE" ]]; then
+              echo "::error::Version metadata could not be read from app/build.gradle.kts."
+              exit 1
+            fi
+            if ! [[ "$VERSION_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "::error::Unsafe versionName in app/build.gradle.kts."
+              exit 1
+            fi
+            echo "Detected versionName=$VERSION_NAME versionCode=$VERSION_CODE"
+            echo "name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+            echo "code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+            echo "tag=v$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          } 2>&1 | tee -a "$LOG"
+
+      - name: Validate release signing secrets and materialize keystore
+        id: signing
+        shell: bash
+        env:
+          LOGANOS_KEYSTORE_BASE64: ${{ secrets.LOGANOS_KEYSTORE_BASE64 }}
+          LOGANOS_STORE_PASSWORD: ${{ secrets.LOGANOS_STORE_PASSWORD }}
+          LOGANOS_KEY_ALIAS: ${{ secrets.LOGANOS_KEY_ALIAS }}
+          LOGANOS_KEY_PASSWORD: ${{ secrets.LOGANOS_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/loganos-gradle-output.txt"
+          for name in LOGANOS_KEYSTORE_BASE64 LOGANOS_STORE_PASSWORD LOGANOS_KEY_ALIAS LOGANOS_KEY_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              message="Missing required GitHub environment secret: ${name}"
+              echo "::error::$message" >&2
+              printf '%s\n' "$message" | tee -a "$LOG" >&2
+              exit 1
+            fi
+          done
+
+          KEYSTORE_PATH="$RUNNER_TEMP/loganos-release.jks"
+          if ! printf '%s' "$LOGANOS_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"; then
+            echo "::error::LOGANOS_KEYSTORE_BASE64 could not be decoded."
+            printf '%s\n' "LOGANOS_KEYSTORE_BASE64 could not be decoded." | tee -a "$LOG" >&2
+            exit 1
           fi
+          if [[ ! -s "$KEYSTORE_PATH" ]]; then
+            echo "::error::Decoded release keystore is empty."
+            printf '%s\n' "Decoded release keystore is empty." | tee -a "$LOG" >&2
+            exit 1
+          fi
+          chmod 600 "$KEYSTORE_PATH"
+          echo "LOGANOS_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
 
       - name: Build signed release APK
+        id: build
         shell: bash
+        env:
+          LOGANOS_STORE_PASSWORD: ${{ secrets.LOGANOS_STORE_PASSWORD }}
+          LOGANOS_KEY_ALIAS: ${{ secrets.LOGANOS_KEY_ALIAS }}
+          LOGANOS_KEY_PASSWORD: ${{ secrets.LOGANOS_KEY_PASSWORD }}
+          LOGANOS_UPDATE_REPOSITORY: ${{ vars.LOGANOS_UPDATE_REPOSITORY || github.repository }}
         run: |
           set -euo pipefail
-          cd "${{ steps.prep.outputs.gradle_root }}"
-          gradle assembleRelease --stacktrace
+          KEYSTORE_PATH="${LOGANOS_KEYSTORE_PATH:-}"
+          cleanup_keystore() { [[ -z "$KEYSTORE_PATH" ]] || rm -f -- "$KEYSTORE_PATH"; }
+          trap cleanup_keystore EXIT
+          trap 'cleanup_keystore; exit 130' INT
+          trap 'cleanup_keystore; exit 143' TERM
+          LOG="$RUNNER_TEMP/loganos-gradle-output.txt"
+          {
+            REPOSITORY_VALUE="$(printf '%s' "${LOGANOS_UPDATE_REPOSITORY:-}" | tr -d '\r\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+            if ! [[ "$REPOSITORY_VALUE" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+              echo "::error::LOGANOS_UPDATE_REPOSITORY must match owner/repo (received an invalid or blank value)."
+              exit 1
+            fi
+            export LOGANOS_UPDATE_REPOSITORY="$REPOSITORY_VALUE"
+            echo "Using validated update repository: $LOGANOS_UPDATE_REPOSITORY"
+            cd "${{ steps.prep.outputs.gradle_root }}"
+            ./gradlew --no-daemon :app:assembleRelease --stacktrace
+            cleanup_keystore
+            KEYSTORE_PATH=""
+            echo "Temporary signing keystore removed immediately after successful build."
+          } 2>&1 | tee -a "$LOG"
 
       - name: Collect APK and checksum
+        id: collect
         env:
           VERSION_NAME: ${{ steps.version.outputs.name }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
-          SOURCE_APK="${{ steps.prep.outputs.gradle_root }}/app/build/outputs/apk/release/app-release.apk"
-          TARGET_APK="dist/LoganOS-v${VERSION_NAME}-release.apk"
-          test -f "$SOURCE_APK"
-          cp "$SOURCE_APK" "$TARGET_APK"
-          (cd dist && sha256sum "$(basename "$TARGET_APK")" > "$(basename "$TARGET_APK").sha256")
+          LOG="$RUNNER_TEMP/loganos-gradle-output.txt"
+          {
+            mkdir -p dist
+            mapfile -t APK_FILES < <(find "${{ steps.prep.outputs.gradle_root }}/app/build/outputs/apk/release" -maxdepth 1 -type f -name '*.apk' | sort)
+            if [[ "${#APK_FILES[@]}" -ne 1 ]]; then
+              echo "::error::Expected exactly one release APK; found ${#APK_FILES[@]}."
+              exit 1
+            fi
+            SOURCE_APK="${APK_FILES[0]}"
+            TARGET_NAME="LoganOS-v${VERSION_NAME}-release.apk"
+            TARGET_APK="dist/$TARGET_NAME"
+            cp "$SOURCE_APK" "$TARGET_APK"
+            (cd dist && sha256sum "$TARGET_NAME" > "$TARGET_NAME.sha256")
+            echo "Collected APK: $TARGET_APK"
+            echo "apk=$TARGET_APK" >> "$GITHUB_OUTPUT"
+          } 2>&1 | tee -a "$LOG"
 
-      - name: Verify APK signature and package
+      - name: Verify APK signature, package and version
+        id: verify
         env:
           VERSION_NAME: ${{ steps.version.outputs.name }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+          EXPECTED_SIGNER_SHA256: ${{ vars.LOGANOS_EXPECTED_SIGNER_SHA256 }}
         shell: bash
         run: |
           set -euo pipefail
-          APK="dist/LoganOS-v${VERSION_NAME}-release.apk"
-          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)
-          AAPT=$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -n 1)
-          test -n "$APKSIGNER"
-          test -n "$AAPT"
-          "$APKSIGNER" verify --verbose --print-certs "$APK" | tee "dist/LoganOS-v${VERSION_NAME}-release.certificate.txt"
-          "$AAPT" dump badging "$APK" | tee "dist/LoganOS-v${VERSION_NAME}-release.badging.txt"
-          grep -q "package: name='com.dcui.loganos'" "dist/LoganOS-v${VERSION_NAME}-release.badging.txt"
-          grep -q "versionName='${VERSION_NAME}'" "dist/LoganOS-v${VERSION_NAME}-release.badging.txt"
+          LOG="$RUNNER_TEMP/loganos-gradle-output.txt"
+          {
+            APK="dist/LoganOS-v${VERSION_NAME}-release.apk"
+            APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+            AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -n 1)"
+            if [[ -z "$APKSIGNER" || -z "$AAPT" ]]; then
+              echo "::error::Android build-tools apksigner or aapt was not found."
+              exit 1
+            fi
+            CERT_FILE="dist/LoganOS-v${VERSION_NAME}-release.certificate.txt"
+            "$APKSIGNER" verify --verbose --print-certs "$APK" 2>&1 | tee "$CERT_FILE"
+            "$AAPT" dump badging "$APK" > "dist/LoganOS-v${VERSION_NAME}-release.badging.txt"
+            BADGING="dist/LoganOS-v${VERSION_NAME}-release.badging.txt"
+            grep -Fq "package: name='com.dcui.loganos'" "$BADGING"
+            grep -Fq "versionCode='${VERSION_CODE}'" "$BADGING"
+            grep -Fq "versionName='${VERSION_NAME}'" "$BADGING"
+
+            if [[ -n "${EXPECTED_SIGNER_SHA256:-}" ]]; then
+              EXPECTED="$(printf '%s' "$EXPECTED_SIGNER_SHA256" | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
+              if ! [[ "$EXPECTED" =~ ^[a-f0-9]{64}$ ]]; then
+                echo "::error::LOGANOS_EXPECTED_SIGNER_SHA256 must be a 64-character SHA-256 fingerprint (colons are optional)."
+                exit 1
+              fi
+              ACTUAL="$(sed -n 's/^Signer #1 certificate SHA-256 digest: *//p' "$CERT_FILE" | head -n 1 | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
+              if [[ -z "$ACTUAL" || "$ACTUAL" != "$EXPECTED" ]]; then
+                echo "::error::APK signer certificate fingerprint does not match LOGANOS_EXPECTED_SIGNER_SHA256."
+                exit 1
+              fi
+              echo "Production signer SHA-256 fingerprint matches the configured pin."
+            else
+              echo "::warning::LOGANOS_EXPECTED_SIGNER_SHA256 is not configured; signer pinning was skipped. Existing-device OTA signature continuity checks remain in the client."
+            fi
+            echo "APK signature, package id, versionName and versionCode verified."
+          } 2>&1 | tee -a "$LOG"
 
       - name: Generate GitHub build provenance attestation
+        id: attest
         uses: actions/attest@v4
         with:
           subject-path: dist/LoganOS-v${{ steps.version.outputs.name }}-release.apk
 
-      - name: Create immutable release assets
+      - name: Publish verified release assets
+        id: publish
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
           VERSION_NAME: ${{ steps.version.outputs.name }}
           RELEASE_NOTES: ${{ inputs.release_notes }}
+          OVERRIDE_EXISTING: ${{ inputs.override_existing }}
         shell: bash
         run: |
           set -euo pipefail
+          LOG="$RUNNER_TEMP/loganos-gradle-output.txt"
+          {
           APK="dist/LoganOS-v${VERSION_NAME}-release.apk"
           SHA="${APK}.sha256"
           CERT="dist/LoganOS-v${VERSION_NAME}-release.certificate.txt"
           BADGING="dist/LoganOS-v${VERSION_NAME}-release.badging.txt"
-
           EXTRA_ARGS=()
           if [[ "$VERSION_NAME" == *"beta"* || "$VERSION_NAME" == *"alpha"* || "$VERSION_NAME" == *"rc"* ]]; then
             EXTRA_ARGS+=(--prerelease)
           fi
 
-          gh release create "$TAG" \
-            "$APK" "$SHA" "$CERT" "$BADGING" \
-            --target "$GITHUB_SHA" \
-            --title "LoganOS v${VERSION_NAME}" \
-            --notes "$RELEASE_NOTES" \
-            "${EXTRA_ARGS[@]}"
+          TAG_EXISTS=false
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            TAG_EXISTS=true
+          fi
+
+          RELEASE_EXISTS=false
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            RELEASE_EXISTS=true
+          fi
+
+          if [[ "$TAG_EXISTS" == "true" && "$RELEASE_EXISTS" == "false" ]]; then
+            echo "::error::Tag $TAG already exists without a GitHub Release. Refusing to move or delete the existing tag."
+            exit 1
+          fi
+
+          if [[ "$RELEASE_EXISTS" == "true" ]]; then
+            if [[ "$OVERRIDE_EXISTING" != "true" ]]; then
+              echo "::error::Release $TAG already exists. Set override_existing only after reviewing the verified replacement APK."
+              exit 1
+            fi
+            echo "Updating existing release assets only after successful build and verification: $TAG"
+            gh release upload "$TAG" "$APK" "$SHA" "$CERT" "$BADGING" --clobber
+            gh release edit "$TAG" --title "LoganOS v${VERSION_NAME}" --notes "$RELEASE_NOTES" "${EXTRA_ARGS[@]}"
+          else
+            if [[ "$TAG_EXISTS" == "true" ]]; then
+              echo "::error::Tag $TAG exists but release lookup did not return it; refusing to overwrite."
+              exit 1
+            fi
+            gh release create "$TAG" \
+              "$APK" "$SHA" "$CERT" "$BADGING" \
+              --target "$GITHUB_SHA" \
+              --title "LoganOS v${VERSION_NAME}" \
+              --notes "$RELEASE_NOTES" \
+              "${EXTRA_ARGS[@]}"
+          fi
+          } 2>&1 | tee -a "$LOG"
 
       - name: Remove signing key from runner
         if: always()
+        id: cleanup
         shell: bash
         run: |
+          set +e
           rm -f "${LOGANOS_KEYSTORE_PATH:-}"
+          unset LOGANOS_STORE_PASSWORD LOGANOS_KEY_ALIAS LOGANOS_KEY_PASSWORD LOGANOS_KEYSTORE_BASE64
+          exit 0
+
+      - name: Redact known signing secrets from diagnostics
+        if: always()
+        id: redact
+        shell: bash
+        env:
+          LOGANOS_KEYSTORE_BASE64: ${{ secrets.LOGANOS_KEYSTORE_BASE64 }}
+          LOGANOS_STORE_PASSWORD: ${{ secrets.LOGANOS_STORE_PASSWORD }}
+          LOGANOS_KEY_ALIAS: ${{ secrets.LOGANOS_KEY_ALIAS }}
+          LOGANOS_KEY_PASSWORD: ${{ secrets.LOGANOS_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/loganos-gradle-output.txt"
+          MARKER="$RUNNER_TEMP/loganos-redaction-failed"
+          rm -f "$MARKER"
+          if [[ ! -f "$LOG" ]]; then
+            exit 0
+          fi
+          if ! python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          log_path = Path(os.environ["RUNNER_TEMP"]) / "loganos-gradle-output.txt"
+          content = log_path.read_text(encoding="utf-8", errors="replace")
+          for key in (
+              "LOGANOS_KEYSTORE_BASE64",
+              "LOGANOS_STORE_PASSWORD",
+              "LOGANOS_KEY_ALIAS",
+              "LOGANOS_KEY_PASSWORD",
+          ):
+              value = os.environ.get(key, "")
+              if value:
+                  content = content.replace(value, f"[REDACTED:{key}]")
+                  content = content.replace(value.replace("\r\n", "\n"), f"[REDACTED:{key}]")
+                  content = content.replace(value.replace("\n", "\r\n"), f"[REDACTED:{key}]")
+          log_path.write_text(content, encoding="utf-8")
+          PY
+          then
+            # Fail closed: do not leave a raw log eligible for artifact upload.
+            rm -f "$LOG" || true
+            : > "$MARKER"
+            echo "::error::Diagnostics redaction failed; raw log was discarded and will not be uploaded."
+            exit 1
+          fi
+      - name: Create release failure report
+        if: always()
+        id: report
+        shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
+          PREP_OUTCOME: ${{ steps.prep.outcome }}
+          WRAPPER_OUTCOME: ${{ steps.wrapper.outcome }}
+          SIGNING_OUTCOME: ${{ steps.signing.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          COLLECT_OUTCOME: ${{ steps.collect.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+          VERSION_OUTCOME: ${{ steps.version.outcome }}
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          JAVA_OUTCOME: ${{ steps.java.outcome }}
+          GRADLE_SETUP_OUTCOME: ${{ steps.gradle_setup.outcome }}
+          REDACT_OUTCOME: ${{ steps.redact.outcome }}
+        run: |
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/LoganOS_Release_Error_Report.txt"
+          LOG="$RUNNER_TEMP/loganos-gradle-output.txt"
+          {
+            echo "LoganOS Secure Release Diagnostic Report"
+            echo "Workflow: $GITHUB_WORKFLOW"
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Run attempt: $GITHUB_RUN_ATTEMPT"
+            echo "Commit: $GITHUB_SHA"
+            echo "Ref: $GITHUB_REF"
+            echo "Job status: $JOB_STATUS"
+            echo
+            echo "=== Step outcomes ==="
+            echo "Checkout: ${CHECKOUT_OUTCOME:-not-run}"
+            echo "Set up JDK: ${JAVA_OUTCOME:-not-run}"
+            echo "Set up Gradle: ${GRADLE_SETUP_OUTCOME:-not-run}"
+            echo "Prepare source: ${PREP_OUTCOME:-not-run}"
+            echo "Generate wrapper: ${WRAPPER_OUTCOME:-not-run}"
+            echo "Read app version: ${VERSION_OUTCOME:-not-run}"
+            echo "Prepare signing: ${SIGNING_OUTCOME:-not-run}"
+            echo "Build signed APK: ${BUILD_OUTCOME:-not-run}"
+            echo "Collect APK: ${COLLECT_OUTCOME:-not-run}"
+            echo "Verify APK: ${VERIFY_OUTCOME:-not-run}"
+            echo "Attestation: ${ATTEST_OUTCOME:-not-run}"
+            echo "Publish release: ${PUBLISH_OUTCOME:-not-run}"
+            echo "Redact diagnostics: ${REDACT_OUTCOME:-not-run}"
+            echo
+            echo "=== Captured Gradle / workflow diagnostics ==="
+            if [[ -f
