@@ -348,7 +348,47 @@ jobs:
               exit 1
             fi
             NOTES_FILE="${NOTES_FILES[0]}"
-            if grep -Fq '<!-- LOGANOS_NOTES_TR_START -->' "$NOTES_FILE"; then
+            if grep -Fq 'LOGANOS_NOTES_' "$NOTES_FILE"; then
+              # A localized notes file must contain exactly one complete, ordered pair
+              # of TR and EN sections. Reject malformed files before extracting/publishing.
+              if ! python3 - "$NOTES_FILE" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+          token_re = re.compile(
+              r"<!--\s*LOGANOS_NOTES_(TR|EN)_(START|END)\s*-->",
+              re.IGNORECASE,
+          )
+          matches = list(token_re.finditer(text))
+          found = [(m.group(1).upper(), m.group(2).upper()) for m in matches]
+          expected = [("TR", "START"), ("TR", "END"), ("EN", "START"), ("EN", "END")]
+          if found != expected:
+              print(
+                  "::error::Localized release notes must contain exactly one ordered "
+                  "TR_START, TR_END, EN_START, EN_END marker sequence.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          for language, start_marker, end_marker in (
+              ("TR", matches[0], matches[1]),
+              ("EN", matches[2], matches[3]),
+          ):
+              if not text[start_marker.end():end_marker.start()].strip():
+                  print(
+                      f"::error::Localized {language} release-note section is empty.",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+          PY
+              then
+                echo "::error::Localized release-note marker validation failed for $NOTES_FILE."
+                exit 1
+              fi
+
               EXTRACTED_NOTES="$RUNNER_TEMP/loganos-release-notes.md"
               if ! awk '
                 /<!-- LOGANOS_NOTES_TR_START -->/ { copying=1 }
@@ -356,7 +396,7 @@ jobs:
                 /<!-- LOGANOS_NOTES_EN_END -->/ { found_end=1; exit }
                 END { if (!copying || !found_end) exit 1 }
               ' "$NOTES_FILE" > "$EXTRACTED_NOTES"; then
-                echo "::error::Localized release-note markers are incomplete in $NOTES_FILE."
+                echo "::error::Localized release-note extraction failed for $NOTES_FILE."
                 exit 1
               fi
               RELEASE_NOTES="$(cat "$EXTRACTED_NOTES")"
