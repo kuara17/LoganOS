@@ -359,7 +359,7 @@ jobs:
           path = Path(sys.argv[1])
           text = path.read_text(encoding="utf-8")
           token_re = re.compile(
-              r"<!--\\s*LOGANOS_NOTES_(TR|EN)_(START|END)\\s*-->",
+              r"<!--\s*LOGANOS_NOTES_(TR|EN)_(START|END)\s*-->",
               re.IGNORECASE,
           )
           matches = list(token_re.finditer(text))
